@@ -12,7 +12,7 @@ using System.Reflection;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 
-[BepInPlugin("com.yourname.multicam", "MultiCamMod", "1.3.0")]
+[BepInPlugin("com.yourname.multicam", "MultiMonitorFeed", "1.3.0")]
 public class Plugin : BaseUnityPlugin
 {
     private enum QualityPreset
@@ -196,7 +196,7 @@ public class Plugin : BaseUnityPlugin
 
     private void Start()
     {
-        Logger.LogInfo("MultiCamMod Loaded");
+        Logger.LogInfo("MultiMonitorFeed Loaded");
     }
 
     private void Update()
