@@ -155,7 +155,8 @@ public class Plugin : BaseUnityPlugin
     private Camera defaultRadarCamera;
     private float radarHeightOffset = 34f;
     private const float InteriorRadarHeightOffset = 14f;
-    private const float InteriorMapNearClip = 6f;
+    // Slightly higher near clip for indoor maps prevents upper floors from covering players in mansion layouts.
+    private const float InteriorMapNearClip = 9f;
     private const float InteriorMapBelowDepth = 2.5f;
     private const float RouteTargetRefreshInterval = 4f;
     private const float RouteLineThickness = 2f;
