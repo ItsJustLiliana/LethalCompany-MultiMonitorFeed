@@ -11,6 +11,7 @@ using System;
 using System.Reflection;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.IO;
 
 [BepInPlugin("com.yourname.multicam", "MultiMonitorFeed", "1.3.0")]
 public class Plugin : BaseUnityPlugin
@@ -32,6 +33,61 @@ public class Plugin : BaseUnityPlugin
 
     private RenderTexture[] playerTextures;
     private RenderTexture[] mapTextures;
+
+    // Debug / filter / priority features
+    private int debugCullingMask = 0; // custom mask edited by debug UI
+    private int debugPriorityMask = 0; // layers that should render on top
+    private bool debugHideSceneObjects = false; // toggle to hide named objects during map renders
+    private string debugFilterKeywordsRaw = ""; // comma-separated keywords
+    private List<Renderer> temporarilyHiddenRenderers = new List<Renderer>(64);
+    private Camera[] mapPriorityCameras;
+    private GameObject debugPanel;
+    private Button[] debugLayerButtons;
+    private Button debugFilterToggleButton;
+    private Button debugResetButton;
+    private InputField debugFilterInput;
+    private Button[] debugFilterPresetButtons;
+    private Text debugLayerReportText;
+    private RectTransform debugReportRect;
+    private Button debugExpandButton;
+    private bool debugReportExpanded = false;
+    private Button debugFullButton;
+    private GameObject fullScreenReportObj;
+    private struct DebugFilterPreset
+    {
+        public readonly string Label;
+        public readonly string Keyword;
+
+        public DebugFilterPreset(string label, string keyword)
+        {
+            Label = label;
+            Keyword = keyword;
+        }
+    }
+
+    private readonly DebugFilterPreset[] debugFilterPresets =
+    {
+        new DebugFilterPreset("GROUND", "ground"),
+        new DebugFilterPreset("SURFACE", "surface"),
+        new DebugFilterPreset("FLOOR", "floor"),
+        new DebugFilterPreset("SHIP", "ship"),
+        new DebugFilterPreset("HANGAR", "hangar"),
+        new DebugFilterPreset("ROCK", "rock"),
+        new DebugFilterPreset("TREE", "tree"),
+        new DebugFilterPreset("BUSH", "bush"),
+        new DebugFilterPreset("GRASS", "grass"),
+        new DebugFilterPreset("ROAD", "road"),
+        new DebugFilterPreset("CLIFF", "cliff"),
+        new DebugFilterPreset("WALL", "wall"),
+        new DebugFilterPreset("DOOR", "door"),
+        new DebugFilterPreset("PIPE", "pipe"),
+        new DebugFilterPreset("VENT", "vent"),
+        new DebugFilterPreset("PILLAR", "pillar"),
+        new DebugFilterPreset("BOX", "box"),
+        new DebugFilterPreset("CRATE", "crate"),
+        new DebugFilterPreset("CONSOLE", "console"),
+        new DebugFilterPreset("MONITOR", "monitor")
+    };
 
     private RawImage[] largeImages;
     private RawImage[] smallImages;
@@ -308,6 +364,7 @@ public class Plugin : BaseUnityPlugin
 
         playerCameras = new Camera[count];
         mapCameras = new Camera[count];
+        mapPriorityCameras = new Camera[count];
 
         playerTextures = new RenderTexture[count];
         mapTextures = new RenderTexture[count];
@@ -444,6 +501,22 @@ public class Plugin : BaseUnityPlugin
             ApplyDefaultMapCameraSettings(mapCam);
 
             mapCameras[i] = mapCam;
+
+            // Create an overlay/prio camera that can render selected priority layers on top
+            GameObject prioObj = new GameObject("MapPrioCam_" + i);
+            prioObj.transform.SetParent(mapObj.transform, false);
+            Camera prioCam = prioObj.AddComponent<Camera>();
+            prioCam.enabled = false;
+            prioCam.orthographic = mapCam.orthographic;
+            prioCam.orthographicSize = mapCam.orthographicSize;
+            prioCam.clearFlags = CameraClearFlags.Depth;
+            prioCam.backgroundColor = Color.clear;
+            prioCam.nearClipPlane = mapCam.nearClipPlane;
+            prioCam.farClipPlane = mapCam.farClipPlane;
+            prioCam.allowHDR = false;
+            prioCam.allowMSAA = false;
+            prioCam.cullingMask = 0;
+            mapPriorityCameras[i] = prioCam;
         }
     }
 
@@ -985,6 +1058,16 @@ public class Plugin : BaseUnityPlugin
         RefreshGlobalAutoText();
         RefreshGlobalRouteText();
 
+        // Debug control in header
+        Button debugButton = CreateButton(parent, "GlobalDebug", "DEBUG", new Vector2(1060f, -16f), new Vector2(106f, 30f), delegate
+        {
+            ToggleDebugPanel();
+        });
+        if (debugButton != null)
+        {
+            debugButton.image.color = new Color(0.54f, 0.28f, 0.78f, 0.96f);
+        }
+
         CreateButton(parent, "Grid4", "4", new Vector2(710f, 16f), new Vector2(46f, 30f), delegate { SetGrid(4); }, new Vector2(1f, 1f), new Vector2(1f, 1f), new Vector2(-246f, -16f));
         CreateButton(parent, "Grid6", "6", new Vector2(764f, 16f), new Vector2(46f, 30f), delegate { SetGrid(6); }, new Vector2(1f, 1f), new Vector2(1f, 1f), new Vector2(-194f, -16f));
         CreateButton(parent, "Grid9", "9", new Vector2(818f, 16f), new Vector2(46f, 30f), delegate { SetGrid(9); }, new Vector2(1f, 1f), new Vector2(1f, 1f), new Vector2(-142f, -16f));
@@ -1006,6 +1089,9 @@ public class Plugin : BaseUnityPlugin
         pageRect.pivot = new Vector2(1f, 1f);
         pageRect.sizeDelta = new Vector2(42f, 28f);
         pageRect.anchoredPosition = new Vector2(-54f, -16f);
+
+        // Make sure debug UI elements are created only once
+        CreateDebugPanel(parent);
     }
 
     private void ToggleTileRatio()
@@ -1339,6 +1425,764 @@ public class Plugin : BaseUnityPlugin
         textRect.offsetMax = new Vector2(-8f, 0f);
 
         tooltipObj.SetActive(false);
+    }
+
+    // --- Debug panel and name-filter utilities ---
+    private void ToggleDebugPanel()
+    {
+        if (debugPanel == null)
+        {
+            CreateDebugPanel(rootRect != null ? (Transform)rootRect : canvas.transform);
+        }
+
+        bool opening = !debugPanel.activeSelf;
+        debugPanel.SetActive(opening);
+        if (opening)
+        {
+            debugPanel.transform.SetAsLastSibling();
+            RefreshDebugButtons();
+        }
+    }
+
+    private void CreateDebugPanel(Transform parent)
+    {
+        if (debugPanel != null)
+        {
+            return;
+        }
+
+        GameObject panelObj = new GameObject("DebugPanel");
+        panelObj.transform.SetParent(parent, false);
+        debugPanel = panelObj;
+
+        Image bg = panelObj.AddComponent<Image>();
+        bg.color = new Color(0f, 0f, 0f, 0.92f);
+
+        RectTransform rect = panelObj.GetComponent<RectTransform>();
+        rect.anchorMin = new Vector2(1f, 1f);
+        rect.anchorMax = new Vector2(1f, 1f);
+        rect.pivot = new Vector2(1f, 1f);
+        rect.sizeDelta = new Vector2(560f, 680f);
+        rect.anchoredPosition = new Vector2(-12f, -48f);
+
+        // Layer buttons grid (8x4)
+        debugLayerButtons = new Button[32];
+        int cols = 8;
+        float cellW = 46f;
+        float cellH = 28f;
+        float startX = 12f;
+        float startY = -12f;
+
+        for (int i = 0; i < 32; i++)
+        {
+            int col = i % cols;
+            int row = i / cols;
+            Vector2 anchored = new Vector2(startX + col * (cellW + 6f), startY - row * (cellH + 6f));
+            int local = i;
+            Button b = CreateButton(panelObj.transform, "LayerBtn_" + i, i.ToString(), anchored, new Vector2(cellW, cellH), delegate
+            {
+                bool ctrl = Keyboard.current != null && ((Keyboard.current.leftCtrlKey != null && Keyboard.current.leftCtrlKey.isPressed) || (Keyboard.current.rightCtrlKey != null && Keyboard.current.rightCtrlKey.isPressed));
+                if (ctrl)
+                {
+                    // toggle priority
+                    ToggleLayerPriority(local);
+                }
+                else
+                {
+                    ToggleLayer(local);
+                }
+                RefreshDebugButtons();
+            });
+            Text layerLabel = GetButtonLabel(b.gameObject);
+            if (layerLabel != null)
+            {
+                layerLabel.fontSize = 12;
+                layerLabel.resizeTextForBestFit = true;
+                layerLabel.resizeTextMinSize = 9;
+                layerLabel.resizeTextMaxSize = 12;
+            }
+            debugLayerButtons[i] = b;
+        }
+
+        // Filter presets and controls
+        debugFilterPresetButtons = new Button[debugFilterPresets.Length];
+        int presetColumns = 4;
+        float presetYTop = -170f;
+        float presetW = 120f;
+        float presetH = 26f;
+        for (int i = 0; i < debugFilterPresets.Length; i++)
+        {
+            int row = i / presetColumns;
+            int col = i % presetColumns;
+            float presetX = 12f + col * 132f;
+            float presetY = presetYTop - row * 30f;
+            DebugFilterPreset preset = debugFilterPresets[i];
+            Button presetButton = CreateButton(panelObj.transform, "FilterPreset_" + preset.Label, preset.Label, new Vector2(presetX, presetY), new Vector2(presetW, presetH), delegate
+            {
+                ToggleDebugFilterKeyword(preset.Keyword);
+            });
+            Text presetLabel = GetButtonLabel(presetButton.gameObject);
+            if (presetLabel != null)
+            {
+                presetLabel.fontSize = 11;
+                presetLabel.resizeTextForBestFit = true;
+                presetLabel.resizeTextMinSize = 8;
+                presetLabel.resizeTextMaxSize = 11;
+            }
+            debugFilterPresetButtons[i] = presetButton;
+        }
+
+        // Filter input
+        GameObject inputObj = new GameObject("DebugFilterInput");
+        inputObj.transform.SetParent(panelObj.transform, false);
+        Image inputBg = inputObj.AddComponent<Image>();
+        inputBg.color = new Color(0.08f, 0.08f, 0.08f, 0.95f);
+        RectTransform inputRect = inputObj.GetComponent<RectTransform>();
+        inputRect.anchorMin = new Vector2(0f, 1f);
+        inputRect.anchorMax = new Vector2(0f, 1f);
+        inputRect.pivot = new Vector2(0f, 1f);
+        inputRect.sizeDelta = new Vector2(298f, 32f);
+        inputRect.anchoredPosition = new Vector2(12f, -342f);
+
+        debugFilterInput = inputObj.AddComponent<InputField>();
+        debugFilterInput.lineType = InputField.LineType.SingleLine;
+
+        GameObject textObj = new GameObject("Text");
+        textObj.transform.SetParent(inputObj.transform, false);
+        Text text = textObj.AddComponent<Text>();
+        text.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+        text.fontSize = 14;
+        text.alignment = TextAnchor.MiddleLeft;
+        text.color = Color.white;
+        RectTransform textRect = textObj.GetComponent<RectTransform>();
+        textRect.anchorMin = Vector2.zero;
+        textRect.anchorMax = Vector2.one;
+        textRect.offsetMin = new Vector2(6f, 0f);
+        textRect.offsetMax = new Vector2(-6f, 0f);
+        debugFilterInput.textComponent = text;
+
+        GameObject placeholderObj = new GameObject("Placeholder");
+        placeholderObj.transform.SetParent(inputObj.transform, false);
+        Text placeholder = placeholderObj.AddComponent<Text>();
+        placeholder.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+        placeholder.fontSize = 14;
+        placeholder.alignment = TextAnchor.MiddleLeft;
+        placeholder.color = new Color(0.7f, 0.7f, 0.7f, 0.7f);
+        placeholder.text = "keywords,comma,separated";
+        RectTransform placeholderRect = placeholderObj.GetComponent<RectTransform>();
+        placeholderRect.anchorMin = Vector2.zero;
+        placeholderRect.anchorMax = Vector2.one;
+        placeholderRect.offsetMin = new Vector2(6f, 0f);
+        placeholderRect.offsetMax = new Vector2(-6f, 0f);
+        debugFilterInput.placeholder = placeholder;
+
+        // Filter toggle and apply/reset buttons
+        debugFilterToggleButton = CreateButton(panelObj.transform, "DebugFilterToggle", "FILTER OFF", new Vector2(322f, -342f), new Vector2(120f, 32f), delegate
+        {
+            debugHideSceneObjects = !debugHideSceneObjects;
+            debugFilterToggleButton.GetComponentInChildren<Text>().text = debugHideSceneObjects ? "FILTER ON" : "FILTER OFF";
+        });
+        Text filterToggleLabel = GetButtonLabel(debugFilterToggleButton.gameObject);
+        if (filterToggleLabel != null)
+        {
+            filterToggleLabel.fontSize = 12;
+            filterToggleLabel.resizeTextForBestFit = true;
+            filterToggleLabel.resizeTextMinSize = 9;
+            filterToggleLabel.resizeTextMaxSize = 12;
+        }
+
+        Button applyButton = CreateButton(panelObj.transform, "DebugApply", "APPLY", new Vector2(12f, -386f), new Vector2(96f, 30f), delegate
+        {
+            debugFilterKeywordsRaw = debugFilterInput != null ? debugFilterInput.text : string.Empty;
+            RefreshDebugButtons();
+        });
+
+        debugResetButton = CreateButton(panelObj.transform, "DebugReset", "RESET", new Vector2(120f, -386f), new Vector2(96f, 30f), delegate
+        {
+            debugCullingMask = 0;
+            debugPriorityMask = 0;
+            debugFilterKeywordsRaw = string.Empty;
+            if (debugFilterInput != null) debugFilterInput.text = string.Empty;
+            RefreshDebugButtons();
+        });
+
+        // Inspect selected layers button
+        Button inspectButton = CreateButton(panelObj.transform, "DebugInspect", "INSPECT", new Vector2(228f, -386f), new Vector2(96f, 30f), delegate
+        {
+            InspectSelectedLayers();
+        });
+
+        // Expand / Shrink report area
+        debugExpandButton = CreateButton(panelObj.transform, "DebugExpand", "ENLARGE", new Vector2(336f, -386f), new Vector2(96f, 30f), delegate
+        {
+            ToggleReportExpand();
+        });
+
+        // Fullscreen toggle
+        debugFullButton = CreateButton(panelObj.transform, "DebugFull", "FULL", new Vector2(444f, -386f), new Vector2(96f, 30f), delegate
+        {
+            ToggleReportFullScreen();
+        });
+
+        // Export report to desktop
+        Button exportButton = CreateButton(panelObj.transform, "DebugExport", "EXPORT", new Vector2(444f, -430f), new Vector2(96f, 30f), delegate
+        {
+            ExportReportToFile();
+        });
+
+        // Layer report area
+        GameObject reportObj = new GameObject("LayerReport");
+        reportObj.transform.SetParent(panelObj.transform, false);
+        RectTransform reportRect = reportObj.AddComponent<RectTransform>();
+        reportRect.anchorMin = new Vector2(0f, 1f);
+        reportRect.anchorMax = new Vector2(0f, 1f);
+        reportRect.pivot = new Vector2(0f, 1f);
+        reportRect.anchoredPosition = new Vector2(12f, -480f);
+        reportRect.sizeDelta = new Vector2(528f, 220f);
+        debugReportRect = reportRect;
+        Image reportBg = reportObj.AddComponent<Image>();
+        reportBg.color = new Color(0f, 0f, 0f, 0.84f);
+        GameObject reportTextObj = new GameObject("ReportText");
+        reportTextObj.transform.SetParent(reportObj.transform, false);
+        Text rpt = reportTextObj.AddComponent<Text>();
+        rpt.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+        rpt.fontSize = 12;
+        rpt.alignment = TextAnchor.UpperLeft;
+        rpt.color = Color.white;
+        RectTransform rptRect = reportTextObj.GetComponent<RectTransform>();
+        rptRect.anchorMin = Vector2.zero;
+        rptRect.anchorMax = Vector2.one;
+        rptRect.offsetMin = new Vector2(6f, 6f);
+        rptRect.offsetMax = new Vector2(-6f, -6f);
+        debugLayerReportText = rpt;
+
+        panelObj.SetActive(false);
+    }
+
+    private void RefreshDebugButtons()
+    {
+        if (debugLayerButtons == null)
+        {
+            return;
+        }
+
+        for (int i = 0; i < debugLayerButtons.Length; i++)
+        {
+            Button b = debugLayerButtons[i];
+            if (b == null) continue;
+            Text lbl = GetButtonLabel(b.gameObject);
+            bool enabled = (debugCullingMask & (1 << i)) != 0;
+            bool prio = (debugPriorityMask & (1 << i)) != 0;
+            if (lbl != null)
+            {
+                lbl.text = i.ToString();
+                lbl.fontSize = 12;
+                lbl.resizeTextForBestFit = true;
+                lbl.resizeTextMinSize = 9;
+                lbl.resizeTextMaxSize = 12;
+            }
+
+            b.image.color = prio
+                ? new Color(0.72f, 0.52f, 0.18f, 0.96f)
+                : enabled
+                    ? new Color(0.12f, 0.56f, 0.12f, 0.94f)
+                    : new Color(0.15f, 0.15f, 0.15f, 0.92f);
+        }
+
+        if (debugFilterToggleButton != null)
+        {
+            Text t = GetButtonLabel(debugFilterToggleButton.gameObject);
+            if (t != null)
+            {
+                t.text = debugHideSceneObjects ? "FILTER ON" : "FILTER OFF";
+            }
+        }
+
+        RefreshDebugFilterPresetButtons();
+    }
+
+    private void RefreshDebugFilterPresetButtons()
+    {
+        if (debugFilterPresetButtons == null)
+        {
+            return;
+        }
+
+        for (int i = 0; i < debugFilterPresetButtons.Length && i < debugFilterPresets.Length; i++)
+        {
+            Button button = debugFilterPresetButtons[i];
+            if (button == null)
+            {
+                continue;
+            }
+
+            bool enabled = HasDebugFilterKeyword(debugFilterPresets[i].Keyword);
+            button.image.color = enabled
+                ? new Color(0.22f, 0.52f, 0.86f, 0.96f)
+                : new Color(0.20f, 0.20f, 0.20f, 0.92f);
+        }
+
+        if (debugFilterInput != null)
+        {
+            debugFilterInput.text = debugFilterKeywordsRaw;
+        }
+    }
+
+    private bool HasDebugFilterKeyword(string keyword)
+    {
+        if (string.IsNullOrWhiteSpace(keyword) || string.IsNullOrWhiteSpace(debugFilterKeywordsRaw))
+        {
+            return false;
+        }
+
+        string[] parts = debugFilterKeywordsRaw.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+        string normalizedNeedle = keyword.Trim().ToLowerInvariant();
+        for (int i = 0; i < parts.Length; i++)
+        {
+            string cleaned = parts[i].Trim().ToLowerInvariant();
+            if (!string.IsNullOrEmpty(cleaned) && cleaned == normalizedNeedle)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void ToggleDebugFilterKeyword(string presetKeyword)
+    {
+        if (string.IsNullOrWhiteSpace(presetKeyword))
+        {
+            return;
+        }
+
+        HashSet<string> activeKeywords = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrWhiteSpace(debugFilterKeywordsRaw))
+        {
+            string[] parts = debugFilterKeywordsRaw.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+            for (int i = 0; i < parts.Length; i++)
+            {
+                string cleaned = parts[i].Trim().ToLowerInvariant();
+                if (!string.IsNullOrEmpty(cleaned))
+                {
+                    activeKeywords.Add(cleaned);
+                }
+            }
+        }
+
+        string normalized = presetKeyword.Trim().ToLowerInvariant();
+        if (activeKeywords.Contains(normalized))
+        {
+            activeKeywords.Remove(normalized);
+        }
+        else
+        {
+            activeKeywords.Add(normalized);
+        }
+
+        debugFilterKeywordsRaw = string.Join(", ", activeKeywords);
+        if (debugFilterInput != null)
+        {
+            debugFilterInput.text = debugFilterKeywordsRaw;
+        }
+
+        debugHideSceneObjects = activeKeywords.Count > 0;
+        RefreshDebugButtons();
+    }
+
+    private void ToggleLayer(int layer)
+    {
+        if (layer < 0 || layer > 31) return;
+        int bit = 1 << layer;
+        if ((debugCullingMask & bit) != 0)
+        {
+            debugCullingMask &= ~bit;
+        }
+        else
+        {
+            debugCullingMask |= bit;
+        }
+    }
+
+    private void ToggleLayerPriority(int layer)
+    {
+        if (layer < 0 || layer > 31) return;
+        int bit = 1 << layer;
+        if ((debugPriorityMask & bit) != 0)
+        {
+            debugPriorityMask &= ~bit;
+        }
+        else
+        {
+            debugPriorityMask |= bit;
+        }
+    }
+
+    private void ApplyNameFilter()
+    {
+        temporarilyHiddenRenderers.Clear();
+        if (!debugHideSceneObjects) return;
+        if (string.IsNullOrWhiteSpace(debugFilterKeywordsRaw)) return;
+
+        string[] parts = debugFilterKeywordsRaw.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+        for (int i = 0; i < parts.Length; i++) parts[i] = parts[i].Trim().ToLowerInvariant();
+        if (parts.Length == 0) return;
+        // If the user requested the special 'terrain' keyword, run a material/mesh-based terrain filter
+        bool wantsTerrain = false;
+        for (int i = 0; i < parts.Length; i++) if (parts[i] == "terrain") { wantsTerrain = true; break; }
+
+        Renderer[] all = UnityEngine.Object.FindObjectsOfType<Renderer>(true);
+        if (wantsTerrain)
+        {
+            ApplyTerrainFilter(all);
+        }
+
+        // Also apply generic name-based hiding for any other keywords
+        for (int i = 0; i < all.Length; i++)
+        {
+            Renderer r = all[i];
+            if (r == null || r.gameObject == null) continue;
+            string name = r.gameObject.name != null ? r.gameObject.name.ToLowerInvariant() : string.Empty;
+            if (LooksLikeContourRenderer(r, name))
+            {
+                continue;
+            }
+
+            for (int k = 0; k < parts.Length; k++)
+            {
+                string part = parts[k];
+                if (string.IsNullOrEmpty(part)) continue;
+                if (part == "terrain") continue; // handled above
+                if (name.Contains(part))
+                {
+                    if (r.enabled)
+                    {
+                        r.enabled = false;
+                        temporarilyHiddenRenderers.Add(r);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    private void ApplyTerrainFilter(Renderer[] all)
+    {
+        if (all == null) return;
+
+        // Candidate terrain material/mesh/name tokens to hide
+        string[] terrainTokens = new[] {
+            "tile", "floor", "dirt", "soil", "grass", "rock", "stone", "ground", "mapradar", "maprad", "marble", "pool", "woodfloor", "tilefloor", "forest", "rocktexture", "terrain", "sand", "dirty", "cliff"
+        };
+
+        for (int i = 0; i < all.Length; i++)
+        {
+            Renderer r = all[i];
+            if (r == null || r.gameObject == null) continue;
+            string name = r.gameObject.name != null ? r.gameObject.name.ToLowerInvariant() : string.Empty;
+            if (LooksLikeContourRenderer(r, name)) continue;
+
+            bool matched = false;
+
+            // Quick name checks for known ground objects
+            if (name.Contains("dirt") || name.Contains("ground") || name.Contains("terrain") || name.Contains("dirtcollider") || name.Contains("pooltile"))
+            {
+                matched = true;
+            }
+
+            // Mesh name checks
+            try
+            {
+                MeshFilter mf = r.GetComponent<MeshFilter>();
+                if (!matched && mf != null && mf.sharedMesh != null)
+                {
+                    string meshName = mf.sharedMesh.name != null ? mf.sharedMesh.name.ToLowerInvariant() : string.Empty;
+                    for (int t = 0; t < terrainTokens.Length; t++) if (meshName.Contains(terrainTokens[t])) { matched = true; break; }
+                }
+            }
+            catch { }
+
+            // Materials checks
+            try
+            {
+                Material[] mats = r.sharedMaterials;
+                if (!matched && mats != null && mats.Length > 0)
+                {
+                    for (int m = 0; m < mats.Length; m++)
+                    {
+                        Material mat = mats[m];
+                        if (mat == null) continue;
+                        string matName = mat.name != null ? mat.name.ToLowerInvariant() : string.Empty;
+                        for (int t = 0; t < terrainTokens.Length; t++) if (matName.Contains(terrainTokens[t])) { matched = true; break; }
+                        if (matched) break;
+                    }
+                }
+            }
+            catch { }
+
+            if (matched)
+            {
+                if (r.enabled)
+                {
+                    r.enabled = false;
+                    temporarilyHiddenRenderers.Add(r);
+                }
+            }
+        }
+    }
+
+    private bool LooksLikeContourRenderer(Renderer renderer, string lowerName)
+    {
+        if (!string.IsNullOrEmpty(lowerName))
+        {
+            if (lowerName.Contains("contour") || lowerName.Contains("contours") || lowerName.Contains("contourline") || lowerName.Contains("contour lines") || lowerName.Contains("heightline") || lowerName.Contains("height lines") || lowerName.Contains("elevation") || lowerName.Contains("topo") || lowerName.Contains("radarline") || lowerName.Contains("route line"))
+            {
+                return true;
+            }
+        }
+
+        try
+        {
+            MeshFilter meshFilter = renderer.GetComponent<MeshFilter>();
+            if (meshFilter != null && meshFilter.sharedMesh != null)
+            {
+                string meshName = meshFilter.sharedMesh.name != null ? meshFilter.sharedMesh.name.ToLowerInvariant() : string.Empty;
+                if (meshName.Contains("contour") || meshName.Contains("height") || meshName.Contains("line") || meshName.Contains("radar") || meshName.Contains("topo"))
+                {
+                    return true;
+                }
+            }
+
+            SkinnedMeshRenderer skinned = renderer as SkinnedMeshRenderer;
+            if (skinned != null && skinned.sharedMesh != null)
+            {
+                string meshName = skinned.sharedMesh.name != null ? skinned.sharedMesh.name.ToLowerInvariant() : string.Empty;
+                if (meshName.Contains("contour") || meshName.Contains("height") || meshName.Contains("line") || meshName.Contains("radar") || meshName.Contains("topo"))
+                {
+                    return true;
+                }
+            }
+
+            Material[] materials = renderer.sharedMaterials;
+            for (int i = 0; i < materials.Length; i++)
+            {
+                Material material = materials[i];
+                if (material == null) continue;
+
+                string materialName = material.name != null ? material.name.ToLowerInvariant() : string.Empty;
+                if (materialName.Contains("contour") || materialName.Contains("height") || materialName.Contains("line") || materialName.Contains("radar") || materialName.Contains("topo"))
+                {
+                    return true;
+                }
+
+                Shader shader = material.shader;
+                if (shader != null)
+                {
+                    string shaderName = shader.name != null ? shader.name.ToLowerInvariant() : string.Empty;
+                    if (shaderName.Contains("contour") || shaderName.Contains("height") || shaderName.Contains("line") || shaderName.Contains("radar") || shaderName.Contains("topo"))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        return false;
+    }
+
+    private void RestoreNameFilter()
+    {
+        for (int i = 0; i < temporarilyHiddenRenderers.Count; i++)
+        {
+            Renderer r = temporarilyHiddenRenderers[i];
+            if (r != null)
+            {
+                try { r.enabled = true; } catch { }
+            }
+        }
+        temporarilyHiddenRenderers.Clear();
+    }
+
+    private void InspectSelectedLayers()
+    {
+        // Build list of explicitly-selected layers (both culling and priority masks)
+        List<int> selectedLayers = new List<int>();
+        for (int i = 0; i < 32; i++)
+        {
+            if ((debugCullingMask & (1 << i)) != 0) selectedLayers.Add(i);
+            else if ((debugPriorityMask & (1 << i)) != 0) selectedLayers.Add(i);
+        }
+
+        if (selectedLayers.Count == 0)
+        {
+            string msg = "No layers selected. Toggle a layer button (or set culling/priority masks) then press INSPECT.";
+            Debug.Log(msg);
+            if (debugLayerReportText != null) debugLayerReportText.text = msg;
+            return;
+        }
+
+        // Determine effective camera mask used for rendering during DEBUG: prefer debugCullingMask when set, otherwise use default radar camera mask or full mask.
+        int effectiveMask = debugCullingMask != 0 ? debugCullingMask : (defaultRadarCamera != null ? defaultRadarCamera.cullingMask : ~0);
+        // Also include priority mask since priority camera renders on top into same RT
+        effectiveMask |= debugPriorityMask;
+
+        Renderer[] all = UnityEngine.Object.FindObjectsOfType<Renderer>(true);
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+
+        sb.AppendLine($"Selected layers: {string.Join(", ", selectedLayers)}");
+        sb.AppendLine($"Effective render mask bits: 0x{effectiveMask:X8}");
+        sb.AppendLine("-- Exact matches (gameObject.layer == selected layer) --");
+
+        for (int si = 0; si < selectedLayers.Count; si++)
+        {
+            int layer = selectedLayers[si];
+            sb.AppendLine($"Layer {layer} ({UnityEngine.LayerMask.LayerToName(layer)}) ->");
+            int count = 0;
+            for (int i = 0; i < all.Length; i++)
+            {
+                Renderer r = all[i];
+                if (r == null || r.gameObject == null) continue;
+                if (r.gameObject.layer != layer) continue;
+                count++;
+                string meshName = "";
+                try { MeshFilter mf = r.GetComponent<MeshFilter>(); if (mf != null && mf.sharedMesh != null) meshName = mf.sharedMesh.name; } catch { }
+                string matInfo = "";
+                try { Material[] mats = r.sharedMaterials; if (mats != null && mats.Length > 0) { for (int m = 0; m < mats.Length; m++) { if (m > 0) matInfo += ", "; matInfo += (mats[m] != null ? mats[m].name : "(null)"); } } } catch { }
+                sb.AppendLine($"  {r.gameObject.name} | mesh: {meshName} | mats: {matInfo}");
+                if (count >= 200) { sb.AppendLine("  ...truncated..."); break; }
+            }
+            sb.AppendLine($"  Total objects on layer: {count}");
+            sb.AppendLine();
+        }
+
+        sb.AppendLine("-- Objects matched by effective render mask (what the map camera will see) --");
+        int matchedCount = 0;
+        for (int i = 0; i < all.Length; i++)
+        {
+            Renderer r = all[i];
+            if (r == null || r.gameObject == null) continue;
+            int objLayer = r.gameObject.layer;
+            if ((effectiveMask & (1 << objLayer)) == 0) continue;
+            matchedCount++;
+            string meshName = "";
+            try { MeshFilter mf = r.GetComponent<MeshFilter>(); if (mf != null && mf.sharedMesh != null) meshName = mf.sharedMesh.name; } catch { }
+            string matInfo = "";
+            try { Material[] mats = r.sharedMaterials; if (mats != null && mats.Length > 0) { for (int m = 0; m < mats.Length; m++) { if (m > 0) matInfo += ", "; matInfo += (mats[m] != null ? mats[m].name : "(null)"); } } } catch { }
+            sb.AppendLine($"  [{objLayer}] {r.gameObject.name} | mesh: {meshName} | mats: {matInfo}");
+            if (matchedCount >= 300) { sb.AppendLine("  ...truncated..."); break; }
+        }
+        sb.AppendLine($"Total objects matched by effective mask: {matchedCount}");
+
+        string report = sb.ToString();
+        Debug.Log(report);
+        if (debugLayerReportText != null)
+        {
+            debugLayerReportText.text = report;
+            if (fullScreenReportObj != null && fullScreenReportObj.activeSelf)
+            {
+                Text fsText = fullScreenReportObj.GetComponentInChildren<Text>();
+                if (fsText != null) fsText.text = report;
+            }
+        }
+    }
+
+    private void ToggleReportExpand()
+    {
+        debugReportExpanded = !debugReportExpanded;
+        if (debugReportRect != null)
+        {
+            float h = debugReportExpanded ? 420f : 220f;
+            debugReportRect.sizeDelta = new Vector2(debugReportRect.sizeDelta.x, h);
+        }
+
+        if (debugExpandButton != null)
+        {
+            Text t = GetButtonLabel(debugExpandButton.gameObject);
+            if (t != null) t.text = debugReportExpanded ? "SHRINK" : "ENLARGE";
+        }
+    }
+
+    private void ToggleReportFullScreen()
+    {
+        if (fullScreenReportObj == null)
+        {
+            GameObject fs = new GameObject("FullScreenReport");
+            fs.transform.SetParent(canvas != null ? canvas.transform : (Transform)rootRect, false);
+            RectTransform fsRect = fs.AddComponent<RectTransform>();
+            fsRect.anchorMin = Vector2.zero;
+            fsRect.anchorMax = Vector2.one;
+            fsRect.pivot = new Vector2(0.5f, 0.5f);
+            fsRect.anchoredPosition = Vector2.zero;
+            fsRect.offsetMin = new Vector2(8f, 8f);
+            fsRect.offsetMax = new Vector2(-8f, -8f);
+            Image bg = fs.AddComponent<Image>();
+            bg.color = new Color(0f, 0f, 0f, 0.96f);
+
+            GameObject txtObj = new GameObject("FullText");
+            txtObj.transform.SetParent(fs.transform, false);
+            Text t = txtObj.AddComponent<Text>();
+            t.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+            t.fontSize = 14;
+            t.alignment = TextAnchor.UpperLeft;
+            t.color = Color.white;
+            t.horizontalOverflow = HorizontalWrapMode.Wrap;
+            RectTransform tRect = txtObj.GetComponent<RectTransform>();
+            tRect.anchorMin = Vector2.zero;
+            tRect.anchorMax = Vector2.one;
+            tRect.offsetMin = new Vector2(12f, 12f);
+            tRect.offsetMax = new Vector2(-12f, -12f);
+
+            fullScreenReportObj = fs;
+        }
+
+        bool now = !fullScreenReportObj.activeSelf;
+        fullScreenReportObj.SetActive(now);
+        if (now && debugLayerReportText != null)
+        {
+            Text fsText = fullScreenReportObj.GetComponentInChildren<Text>();
+            if (fsText != null) fsText.text = debugLayerReportText.text;
+        }
+
+        if (debugFullButton != null)
+        {
+            Text t = GetButtonLabel(debugFullButton.gameObject);
+            if (t != null) t.text = fullScreenReportObj.activeSelf ? "CLOSE" : "FULL";
+        }
+    }
+
+    private void ExportReportToFile()
+    {
+        try
+        {
+            string report = debugLayerReportText != null ? debugLayerReportText.text : string.Empty;
+            if (string.IsNullOrEmpty(report))
+            {
+                Debug.Log("No report to export.");
+                return;
+            }
+
+            string desktop = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
+            string fileName = "MultiMonitor_Report_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".txt";
+            string path = Path.Combine(desktop, fileName);
+            File.WriteAllText(path, report);
+            Debug.Log($"Exported debug report to: {path}");
+            if (debugLayerReportText != null)
+            {
+                debugLayerReportText.text = "Saved to: " + path + "\n\n" + debugLayerReportText.text;
+            }
+            if (fullScreenReportObj != null && fullScreenReportObj.activeSelf)
+            {
+                Text fsText = fullScreenReportObj.GetComponentInChildren<Text>();
+                if (fsText != null) fsText.text = debugLayerReportText != null ? debugLayerReportText.text : report;
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.Log("Failed to export report: " + ex.Message);
+        }
     }
 
     private void CreateTile(int index, string playerName)
@@ -2765,7 +3609,7 @@ public class Plugin : BaseUnityPlugin
 
     private void CycleMapType(int index)
     {
-        mapTypeIndex[index] = (mapTypeIndex[index] + 1) % 3;
+        mapTypeIndex[index] = (mapTypeIndex[index] + 1) % 4; // add DEBUG mode
         RefreshTileFeeds(index);
         RefreshMenuText(index);
     }
@@ -2780,6 +3624,17 @@ public class Plugin : BaseUnityPlugin
         if (mapType == 1)
         {
             return "ALT";
+        }
+
+        if (mapType == 2)
+        {
+            return "VANILLA";
+        }
+
+        // 3 = DEBUG
+        if (mapType == 3)
+        {
+            return "DEBUG";
         }
 
         return "VANILLA";
@@ -2804,6 +3659,10 @@ public class Plugin : BaseUnityPlugin
             int mapSize = GetMapTextureSize(cameraQuality[index]);
             ReplaceRenderTexture(ref mapTextures[index], mapSize, mapSize);
             mapCameras[index].targetTexture = mapTextures[index];
+            if (mapPriorityCameras != null && index < mapPriorityCameras.Length && mapPriorityCameras[index] != null)
+            {
+                mapPriorityCameras[index].targetTexture = mapTextures[index];
+            }
         }
     }
 
@@ -3880,7 +4739,7 @@ public class Plugin : BaseUnityPlugin
                 mapCameras[i].transform.position = player.transform.position + Vector3.up * (radarOffsetForPlayer + 12f);
                 mapCameras[i].transform.rotation = Quaternion.Euler(90f, 0f, 0f);
             }
-            else
+            else if (mapType == 2)
             {
                 // Vanilla mode: clone ship radar camera settings, but render per-player map on our own camera.
                 if (defaultRadarCamera != null)
@@ -3917,6 +4776,50 @@ public class Plugin : BaseUnityPlugin
                     mapCameras[i].enabled = false;
                 }
             }
+            else if (mapType == 3)
+            {
+                // DEBUG map: base off vanilla but allow debug masks and filters to be applied during render.
+                if (defaultRadarCamera != null)
+                {
+                    mapCameras[i].CopyFrom(defaultRadarCamera);
+                    mapCameras[i].orthographic = true;
+                    mapCameras[i].clearFlags = CameraClearFlags.SolidColor;
+                    mapCameras[i].backgroundColor = defaultRadarCamera.backgroundColor;
+                    mapCameras[i].nearClipPlane = mapNearClipForPlayer;
+                    mapCameras[i].farClipPlane = mapFarClipForPlayer;
+                    mapCameras[i].transform.position = player.transform.position + Vector3.up * (radarOffsetForPlayer + RadarContourHeightBoost);
+                    mapCameras[i].transform.rotation = Quaternion.Euler(90f, defaultRadarCamera.transform.eulerAngles.y, 0f);
+                    mapCameras[i].orthographicSize = MapZoomSizes[mapZoomIndex[i]];
+                    mapCameras[i].rect = new Rect(0f, 0f, 1f, 1f);
+                    mapCameras[i].targetTexture = mapTextures[i];
+                    mapCameras[i].enabled = false;
+                    mapCameras[i].allowHDR = false;
+                    mapCameras[i].allowMSAA = false;
+
+                    // If no debug culling specified, use default radar mask minus UI overlays
+                    if (debugCullingMask == 0)
+                    {
+                        mapCameras[i].cullingMask = defaultRadarCamera.cullingMask & ~(1 << 5);
+                    }
+                    else
+                    {
+                        mapCameras[i].cullingMask = debugCullingMask;
+                    }
+                }
+                else
+                {
+                    mapCameras[i].orthographic = true;
+                    mapCameras[i].orthographicSize = MapZoomSizes[mapZoomIndex[i]];
+                    mapCameras[i].clearFlags = CameraClearFlags.SolidColor;
+                    mapCameras[i].backgroundColor = Color.black;
+                    mapCameras[i].cullingMask = debugCullingMask != 0 ? debugCullingMask : ~0;
+                    mapCameras[i].nearClipPlane = mapNearClipForPlayer;
+                    mapCameras[i].farClipPlane = mapFarClipForPlayer;
+                    mapCameras[i].transform.position = player.transform.position + Vector3.up * (radarHeightOffset + 60f);
+                    mapCameras[i].transform.rotation = Quaternion.Euler(90f, 0f, 0f);
+                    mapCameras[i].enabled = false;
+                }
+            }
 
             UpdateRouteLines(i, player);
 
@@ -3943,7 +4846,44 @@ public class Plugin : BaseUnityPlugin
             if (Time.unscaledTime >= nextMapRender[i])
             {
                 nextMapRender[i] = Time.unscaledTime + mapInterval;
+                if (mapType == 3)
+                {
+                    // Optionally hide scene objects by name during debug map render
+                    if (debugHideSceneObjects)
+                    {
+                        ApplyNameFilter();
+                    }
+
+                    // If debug mask is set, override culling mask for this render
+                    if (debugCullingMask != 0)
+                    {
+                        mapCameras[i].cullingMask = debugCullingMask;
+                    }
+                }
+
                 mapCameras[i].Render();
+
+                // Render priority overlay layers into same render texture (only meaningful for DEBUG)
+                if (mapPriorityCameras != null && i < mapPriorityCameras.Length && mapPriorityCameras[i] != null && mapType == 3)
+                {
+                    Camera prio = mapPriorityCameras[i];
+                    prio.transform.position = mapCameras[i].transform.position;
+                    prio.transform.rotation = mapCameras[i].transform.rotation;
+                    prio.orthographicSize = mapCameras[i].orthographicSize;
+                    prio.nearClipPlane = mapCameras[i].nearClipPlane;
+                    prio.farClipPlane = mapCameras[i].farClipPlane;
+                    prio.targetTexture = mapCameras[i].targetTexture;
+                    prio.cullingMask = debugPriorityMask;
+                    if (debugPriorityMask != 0)
+                    {
+                        prio.Render();
+                    }
+                }
+
+                if (mapType == 3 && debugHideSceneObjects)
+                {
+                    RestoreNameFilter();
+                }
             }
         }
     }
